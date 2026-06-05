@@ -32,7 +32,6 @@
 // Spiel-Konstanten
 // ============================================================
 #define EINSATZ 20  // Cent
-#define LONG_PRESS_MS 600
 
 // Symbol-IDs (Walzen). Pixel-Art-Symbole als IDs, Render via switch.
 typedef enum {
@@ -832,24 +831,11 @@ static void update_flash(void) {
   }
 }
 
-static void update_long_press(void) {
-  if (g.down_pressed_ms == 0 || g.down_long_fired) return;
-  uint32_t t = now_ms();
-  if (t - g.down_pressed_ms >= LONG_PRESS_MS) {
-    g.down_long_fired = true;
-    // DOWN-long -> Quer-Start im Risiko
-    if (g.state == STATE_RISIKO && !g.quer_active) {
-      quer_start_action();
-    }
-  }
-}
-
 static void tick_cb(void *ctx) {
   s_tick_timer = NULL;
   if (g.state == STATE_SPINNING) update_spinning();
   if (g.state == STATE_RISIKO && g.quer_active) update_quer();
   update_flash();
-  update_long_press();
   redraw();
   schedule_tick();
 }
@@ -1147,6 +1133,102 @@ static void draw_quer_overlay(GContext *ctx) {
   }
 }
 
+static void draw_info_panel(GContext *ctx, GRect bounds) {
+  // Box im mittleren Bereich, zeigt aktuelle Risiko-Stufe oder Status
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 4, GCornersAll);
+  graphics_context_set_stroke_color(ctx, GColorYellow);
+  graphics_draw_round_rect(ctx, bounds, 4);
+
+  GFont fb = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  GFont fs = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+
+  if (g.state == STATE_RISIKO && !g.quer_active) {
+    // Aktuelle Stufe gross anzeigen
+    int n; const Stufe *l = current_leiter(&n);
+    int8_t cur = current_idx();
+    if (cur >= 0) {
+      Stufe st = l[cur];
+      char big[24];
+      switch (st.typ) {
+        case ST_CENT:  snprintf(big, sizeof(big), "%d Cent", st.val); break;
+        case ST_SP:    snprintf(big, sizeof(big), "%d SP", st.val); break;
+        case ST_MULTI: snprintf(big, sizeof(big), "%d MULTI", st.val); break;
+        case ST_GIGA:  snprintf(big, sizeof(big), "%d GIGA", st.val); break;
+        case ST_MA:    strcpy(big, "MULTI-AUS"); break;
+        case ST_AUS:   strcpy(big, "AUS"); break;
+        default:       strcpy(big, "?"); break;
+      }
+      graphics_context_set_text_color(ctx, GColorYellow);
+      graphics_draw_text(ctx, big, fb,
+                         GRect(bounds.origin.x, bounds.origin.y + 4,
+                               bounds.size.w, 22),
+                         GTextOverflowModeTrailingEllipsis,
+                         GTextAlignmentCenter, NULL);
+      // Hinweise je nach verfuegbaren Aktionen
+      char hint[40];
+      const char *quer_hint = quer_set_for_current() ? " C-lang=QUER" : "";
+      if (g.risiko_can_teilen) {
+        snprintf(hint, sizeof(hint), "A=1:1 B=STOPP C=TEIL%s", quer_hint);
+      } else {
+        snprintf(hint, sizeof(hint), "A=1:1 B=STOPP%s", quer_hint);
+      }
+      graphics_context_set_text_color(ctx, GColorLightGray);
+      graphics_draw_text(ctx, hint, fs,
+                         GRect(bounds.origin.x + 2, bounds.origin.y + 28,
+                               bounds.size.w - 4, 18),
+                         GTextOverflowModeTrailingEllipsis,
+                         GTextAlignmentCenter, NULL);
+      // Seite: L oder R
+      char seite_buf[16];
+      snprintf(seite_buf, sizeof(seite_buf), "Seite %c",
+               (g.risiko_seite == 'L' ? 'L' : 'R'));
+      graphics_context_set_text_color(ctx, GColorChromeYellow);
+      graphics_draw_text(ctx, seite_buf, fs,
+                         GRect(bounds.origin.x, bounds.origin.y + 48,
+                               bounds.size.w, 16),
+                         GTextOverflowModeTrailingEllipsis,
+                         GTextAlignmentCenter, NULL);
+    }
+  } else if (g.state == STATE_SPINNING) {
+    graphics_context_set_text_color(ctx, GColorChromeYellow);
+    graphics_draw_text(ctx, "SPINNING...", fb,
+                       GRect(bounds.origin.x, bounds.origin.y + 8,
+                             bounds.size.w, 22),
+                       GTextOverflowModeTrailingEllipsis,
+                       GTextAlignmentCenter, NULL);
+    graphics_context_set_text_color(ctx, GColorLightGray);
+    graphics_draw_text(ctx, "B = Walze stoppen", fs,
+                       GRect(bounds.origin.x, bounds.origin.y + 34,
+                             bounds.size.w, 16),
+                       GTextOverflowModeTrailingEllipsis,
+                       GTextAlignmentCenter, NULL);
+  } else {
+    // IDLE: zeige Statistik + Hinweise
+    graphics_context_set_text_color(ctx, GColorYellow);
+    graphics_draw_text(ctx, "Bally 493", fb,
+                       GRect(bounds.origin.x, bounds.origin.y + 2,
+                             bounds.size.w, 22),
+                       GTextOverflowModeTrailingEllipsis,
+                       GTextAlignmentCenter, NULL);
+    char st[40];
+    snprintf(st, sizeof(st), "%ld Spiele  %ld Gew.",
+             (long)g.stats_spiele, (long)g.stats_gewinne);
+    graphics_context_set_text_color(ctx, GColorLightGray);
+    graphics_draw_text(ctx, st, fs,
+                       GRect(bounds.origin.x, bounds.origin.y + 26,
+                             bounds.size.w, 16),
+                       GTextOverflowModeTrailingEllipsis,
+                       GTextAlignmentCenter, NULL);
+    graphics_context_set_text_color(ctx, GColorLightGray);
+    graphics_draw_text(ctx, "A=Start  C=Muenze", fs,
+                       GRect(bounds.origin.x, bounds.origin.y + 46,
+                             bounds.size.w, 16),
+                       GTextOverflowModeTrailingEllipsis,
+                       GTextAlignmentCenter, NULL);
+  }
+}
+
 static void main_layer_update(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
@@ -1161,11 +1243,18 @@ static void main_layer_update(Layer *layer, GContext *ctx) {
   draw_leiter(ctx, rr, LEITER_RECHTS, LEITER_RECHTS_N,
               g.risiko_right_idx, g.pfeile_rechts, false);
 
-  // Walzen
-  GRect wr = GRect(WALZEN_X + 2, BODY_Y0 + 4, WALZEN_W - 4, BODY_H - 8);
+  // Mittelteil aufteilen: Walzen oben (kompakt), Info-Box unten
+  int mid_x = WALZEN_X + 2;
+  int mid_w = WALZEN_W - 4;
+  int walzen_h = 76;
+  GRect wr = GRect(mid_x, BODY_Y0 + 4, mid_w, walzen_h);
   draw_walzen(ctx, wr);
 
-  // Quer-Overlay ueber Walzen wenn aktiv
+  GRect info = GRect(mid_x, BODY_Y0 + 4 + walzen_h + 4,
+                     mid_w, BODY_H - 12 - walzen_h);
+  draw_info_panel(ctx, info);
+
+  // Quer-Overlay ueber den ganzen Mittelteil wenn aktiv
   draw_quer_overlay(ctx);
 
   draw_footer(ctx);
@@ -1214,35 +1303,35 @@ static void btn_select_click(ClickRecognizerRef rec, void *ctx) {
   redraw();
 }
 
-static void btn_down_down(ClickRecognizerRef rec, void *ctx) {
+static void btn_down_click(ClickRecognizerRef rec, void *ctx) {
   (void)rec; (void)ctx;
-  g.down_pressed_ms = now_ms();
-  g.down_long_fired = false;
-}
-
-static void btn_down_up(ClickRecognizerRef rec, void *ctx) {
-  (void)rec; (void)ctx;
-  uint32_t held = (g.down_pressed_ms > 0) ? (now_ms() - g.down_pressed_ms) : 0;
-  bool was_long = g.down_long_fired;
-  g.down_pressed_ms = 0;
-  g.down_long_fired = false;
-  if (was_long) return;  // Long bereits behandelt
-  // Kurzer Press
+  // Kurzer Press auf DOWN
   if (g.state == STATE_IDLE) {
-    // Muenze einwerfen (50c, wie am Pi)
-    g.muenzspeicher += 100;  // 1 Euro
+    // Muenze einwerfen (1 Euro)
+    g.muenzspeicher += 100;
     message_set("+1.00 EUR", 800);
   } else if (g.state == STATE_RISIKO && !g.quer_active) {
     if (g.risiko_can_teilen) risiko_teilen();
   }
-  (void)held;
+  redraw();
+}
+
+static void btn_down_long_click(ClickRecognizerRef rec, void *ctx) {
+  (void)rec; (void)ctx;
+  // Long-Press auf DOWN -> Quer-Start im Risiko
+  if (g.state == STATE_RISIKO && !g.quer_active) {
+    quer_start_action();
+  }
   redraw();
 }
 
 static void click_config_provider(void *ctx) {
+  (void)ctx;
   window_single_click_subscribe(BUTTON_ID_UP, btn_up_click);
   window_single_click_subscribe(BUTTON_ID_SELECT, btn_select_click);
-  window_raw_click_subscribe(BUTTON_ID_DOWN, btn_down_down, btn_down_up, NULL);
+  window_single_click_subscribe(BUTTON_ID_DOWN, btn_down_click);
+  // Long-Press DOWN fuer Quer-Spiel (600ms)
+  window_long_click_subscribe(BUTTON_ID_DOWN, 600, btn_down_long_click, NULL);
 }
 
 // ============================================================
