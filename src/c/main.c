@@ -1083,150 +1083,106 @@ static void draw_footer(GContext *ctx) {
   }
 }
 
-static void draw_quer_overlay(GContext *ctx) {
-  if (!g.quer_active) return;
+// Zeichnet eine Quer-Reihe (horizontal): die Items als kleine Boxen nebeneinander.
+// Wenn 'active' (das aktive Lichtorgel-Set), wird das aktuelle Item hell.
+// Wenn 'available' (Trigger-Stufe ist gerade aktiv), Rahmen in Gelb.
+static void draw_quer_reihe(GContext *ctx, GRect bounds, char set_name,
+                             bool active, bool available) {
   int qn;
-  const Stufe *items = quer_set_items(g.quer_set_name, &qn);
-  if (qn == 0) return;
+  const Stufe *items = quer_set_items(set_name, &qn);
+  if (qn <= 0 || !items) return;
 
-  // Box mittig im Body, ueberlagert Walzen
-  int bx = WALZEN_X + 4;
-  int by = BODY_Y0 + 12;
-  int bw = WALZEN_W - 8;
-  int bh = BODY_H - 24;
-  GRect box = GRect(bx, by, bw, bh);
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, box, 4, GCornersAll);
-  graphics_context_set_stroke_color(ctx, GColorYellow);
-  graphics_draw_round_rect(ctx, box, 4);
+  // Hintergrund-Rahmen
+  GColor outline = available ? GColorYellow : GColorDarkGray;
+  graphics_context_set_stroke_color(ctx, outline);
+  graphics_draw_round_rect(ctx, bounds, 3);
 
-  GFont fb = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
-  GFont fs = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  // Set-Label oben links (klein)
+  GFont fmini = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  char lbl[4]; lbl[0] = set_name; lbl[1] = 0;
+  graphics_context_set_text_color(ctx, available ? GColorYellow : GColorLightGray);
+  graphics_draw_text(ctx, lbl, fmini,
+                     GRect(bounds.origin.x + 2, bounds.origin.y - 2, 10, 14),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  graphics_context_set_text_color(ctx, GColorYellow);
-  graphics_draw_text(ctx, "QUER - B=STOP", fs, GRect(bx, by + 2, bw, 14),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-
-  int item_h = (bh - 20) / qn;
+  // Items als Boxen
+  int items_x = bounds.origin.x + 12;
+  int items_w = bounds.size.w - 14;
+  int item_w = items_w / qn;
+  int item_y = bounds.origin.y + 2;
+  int item_h = bounds.size.h - 4;
   for (int i = 0; i < qn; i++) {
-    GRect r = GRect(bx + 4, by + 18 + i * item_h, bw - 8, item_h - 2);
-    bool lit = (i == g.quer_pos);
-    GColor bg = lit ? GColorYellow : GColorOxfordBlue;
-    GColor fg = lit ? GColorBlack : GColorLightGray;
+    GRect r = GRect(items_x + i * item_w + 1, item_y, item_w - 2, item_h);
+    bool lit = active && (i == g.quer_pos);
+    GColor bg = lit ? GColorYellow : (available ? GColorOxfordBlue : GColorBlack);
+    GColor fg = lit ? GColorBlack : (available ? GColorWhite : GColorLightGray);
     graphics_context_set_fill_color(ctx, bg);
-    graphics_fill_rect(ctx, r, 3, GCornersAll);
-    graphics_context_set_stroke_color(ctx, GColorDarkGray);
-    graphics_draw_round_rect(ctx, r, 3);
+    graphics_fill_rect(ctx, r, 2, GCornersAll);
 
-    char buf[16];
+    char buf[8];
     Stufe st = items[i];
     switch (st.typ) {
-      case ST_SP:      snprintf(buf, sizeof(buf), "%d SP", st.val); break;
-      case ST_MULTI:   snprintf(buf, sizeof(buf), "%d MULTI", st.val); break;
-      case ST_GIGA:    snprintf(buf, sizeof(buf), "%d GIGA", st.val); break;
-      case ST_MYSTERY: strcpy(buf, "MYSTERY"); break;
+      case ST_SP:      snprintf(buf, sizeof(buf), "%dS", st.val); break;
+      case ST_MULTI:   snprintf(buf, sizeof(buf), "%dM", st.val); break;
+      case ST_GIGA:    snprintf(buf, sizeof(buf), "%dG", st.val); break;
+      case ST_MYSTERY: strcpy(buf, "?"); break;
       default:         strcpy(buf, "?"); break;
     }
+    // Label zentriert
     GRect tr = r;
-    tr.origin.y += (item_h - 14) / 2 - 2;
-    draw_text_centered(ctx, buf, tr, fb, fg);
+    tr.origin.y += (item_h - 14) / 2 - 1;
+    draw_text_centered(ctx, buf, tr, fmini, fg);
   }
 }
 
-static void draw_info_panel(GContext *ctx, GRect bounds) {
-  // Box im mittleren Bereich, zeigt aktuelle Risiko-Stufe oder Status
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, bounds, 4, GCornersAll);
-  graphics_context_set_stroke_color(ctx, GColorYellow);
-  graphics_draw_round_rect(ctx, bounds, 4);
-
-  GFont fb = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+// Zeichnet eine kompakte Info-Zeile mit dem aktuell relevanten Text
+static void draw_info_line(GContext *ctx, GRect bounds) {
   GFont fs = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  char buf[40];
+  GColor col = GColorYellow;
 
-  if (g.state == STATE_RISIKO && !g.quer_active) {
-    // Aktuelle Stufe gross anzeigen
-    int n; const Stufe *l = current_leiter(&n);
-    int8_t cur = current_idx();
-    if (cur >= 0) {
-      Stufe st = l[cur];
-      char big[24];
-      switch (st.typ) {
-        case ST_CENT:  snprintf(big, sizeof(big), "%d Cent", st.val); break;
-        case ST_SP:    snprintf(big, sizeof(big), "%d SP", st.val); break;
-        case ST_MULTI: snprintf(big, sizeof(big), "%d MULTI", st.val); break;
-        case ST_GIGA:  snprintf(big, sizeof(big), "%d GIGA", st.val); break;
-        case ST_MA:    strcpy(big, "MULTI-AUS"); break;
-        case ST_AUS:   strcpy(big, "AUS"); break;
-        default:       strcpy(big, "?"); break;
-      }
-      graphics_context_set_text_color(ctx, GColorYellow);
-      graphics_draw_text(ctx, big, fb,
-                         GRect(bounds.origin.x, bounds.origin.y + 4,
-                               bounds.size.w, 22),
-                         GTextOverflowModeTrailingEllipsis,
-                         GTextAlignmentCenter, NULL);
-      // Hinweise je nach verfuegbaren Aktionen
-      char hint[40];
-      const char *quer_hint = quer_set_for_current() ? " C-lang=QUER" : "";
-      if (g.risiko_can_teilen) {
-        snprintf(hint, sizeof(hint), "A=1:1 B=STOPP C=TEIL%s", quer_hint);
+  if (g.state == STATE_RISIKO) {
+    if (g.quer_active) {
+      strcpy(buf, "QUER: B = STOP!");
+      col = GColorChromeYellow;
+    } else {
+      // Zeige aktuellen Stufenwert
+      int n; const Stufe *l = current_leiter(&n);
+      int8_t cur = current_idx();
+      if (cur >= 0) {
+        Stufe st = l[cur];
+        switch (st.typ) {
+          case ST_CENT:  snprintf(buf, sizeof(buf), "Risiko: %d c", st.val); break;
+          case ST_SP:    snprintf(buf, sizeof(buf), "Risiko: %d SP", st.val); break;
+          case ST_MULTI: snprintf(buf, sizeof(buf), "Risiko: %d MULTI", st.val); break;
+          case ST_GIGA:  snprintf(buf, sizeof(buf), "Risiko: %d GIGA", st.val); break;
+          case ST_MA:    strcpy(buf, "Risiko: MULTI-AUS"); break;
+          default:       strcpy(buf, "Risiko"); break;
+        }
       } else {
-        snprintf(hint, sizeof(hint), "A=1:1 B=STOPP%s", quer_hint);
+        strcpy(buf, "Risiko");
       }
-      graphics_context_set_text_color(ctx, GColorLightGray);
-      graphics_draw_text(ctx, hint, fs,
-                         GRect(bounds.origin.x + 2, bounds.origin.y + 28,
-                               bounds.size.w - 4, 18),
-                         GTextOverflowModeTrailingEllipsis,
-                         GTextAlignmentCenter, NULL);
-      // Seite: L oder R
-      char seite_buf[16];
-      snprintf(seite_buf, sizeof(seite_buf), "Seite %c",
-               (g.risiko_seite == 'L' ? 'L' : 'R'));
-      graphics_context_set_text_color(ctx, GColorChromeYellow);
-      graphics_draw_text(ctx, seite_buf, fs,
-                         GRect(bounds.origin.x, bounds.origin.y + 48,
-                               bounds.size.w, 16),
-                         GTextOverflowModeTrailingEllipsis,
-                         GTextAlignmentCenter, NULL);
     }
   } else if (g.state == STATE_SPINNING) {
-    graphics_context_set_text_color(ctx, GColorChromeYellow);
-    graphics_draw_text(ctx, "SPINNING...", fb,
-                       GRect(bounds.origin.x, bounds.origin.y + 8,
-                             bounds.size.w, 22),
-                       GTextOverflowModeTrailingEllipsis,
-                       GTextAlignmentCenter, NULL);
-    graphics_context_set_text_color(ctx, GColorLightGray);
-    graphics_draw_text(ctx, "B = Walze stoppen", fs,
-                       GRect(bounds.origin.x, bounds.origin.y + 34,
-                             bounds.size.w, 16),
-                       GTextOverflowModeTrailingEllipsis,
-                       GTextAlignmentCenter, NULL);
+    strcpy(buf, "SPIN - B = STOP");
+    col = GColorChromeYellow;
   } else {
-    // IDLE: zeige Statistik + Hinweise
-    graphics_context_set_text_color(ctx, GColorYellow);
-    graphics_draw_text(ctx, "Bally 493", fb,
-                       GRect(bounds.origin.x, bounds.origin.y + 2,
-                             bounds.size.w, 22),
-                       GTextOverflowModeTrailingEllipsis,
-                       GTextAlignmentCenter, NULL);
-    char st[40];
-    snprintf(st, sizeof(st), "%ld Spiele  %ld Gew.",
-             (long)g.stats_spiele, (long)g.stats_gewinne);
-    graphics_context_set_text_color(ctx, GColorLightGray);
-    graphics_draw_text(ctx, st, fs,
-                       GRect(bounds.origin.x, bounds.origin.y + 26,
-                             bounds.size.w, 16),
-                       GTextOverflowModeTrailingEllipsis,
-                       GTextAlignmentCenter, NULL);
-    graphics_context_set_text_color(ctx, GColorLightGray);
-    graphics_draw_text(ctx, "A=Start  C=Muenze", fs,
-                       GRect(bounds.origin.x, bounds.origin.y + 46,
-                             bounds.size.w, 16),
-                       GTextOverflowModeTrailingEllipsis,
-                       GTextAlignmentCenter, NULL);
+    // Idle: Message oder Statistik
+    uint32_t t = now_ms();
+    if (g.message[0] && t < g.message_until) {
+      strncpy(buf, g.message, sizeof(buf) - 1);
+      buf[sizeof(buf) - 1] = 0;
+    } else {
+      snprintf(buf, sizeof(buf), "%ld Spiele / %ld Gew.",
+               (long)g.stats_spiele, (long)g.stats_gewinne);
+      col = GColorLightGray;
+    }
   }
+
+  graphics_context_set_text_color(ctx, col);
+  graphics_draw_text(ctx, buf, fs, bounds,
+                     GTextOverflowModeTrailingEllipsis,
+                     GTextAlignmentCenter, NULL);
 }
 
 static void main_layer_update(Layer *layer, GContext *ctx) {
@@ -1243,19 +1199,42 @@ static void main_layer_update(Layer *layer, GContext *ctx) {
   draw_leiter(ctx, rr, LEITER_RECHTS, LEITER_RECHTS_N,
               g.risiko_right_idx, g.pfeile_rechts, false);
 
-  // Mittelteil aufteilen: Walzen oben (kompakt), Info-Box unten
+  // Mittelteil-Layout:
+  //   Walzen kompakt oben (~60px)
+  //   Set C (MULTI 12)   ~22px
+  //   Set B (SP 12/SP 10) ~22px
+  //   Set A (SP 6/SP 5)   ~22px
+  //   Info-Zeile          ~16px
   int mid_x = WALZEN_X + 2;
   int mid_w = WALZEN_W - 4;
-  int walzen_h = 76;
-  GRect wr = GRect(mid_x, BODY_Y0 + 4, mid_w, walzen_h);
+  int y = BODY_Y0 + 3;
+
+  // Walzen
+  int walzen_h = 60;
+  GRect wr = GRect(mid_x, y, mid_w, walzen_h);
   draw_walzen(ctx, wr);
+  y += walzen_h + 4;
 
-  GRect info = GRect(mid_x, BODY_Y0 + 4 + walzen_h + 4,
-                     mid_w, BODY_H - 12 - walzen_h);
-  draw_info_panel(ctx, info);
+  // Welches Set ist aktuell verfuegbar (Quer-Trigger an dieser Stufe)?
+  char avail_set = (g.state == STATE_RISIKO && !g.quer_active)
+                     ? quer_set_for_current() : 0;
+  // Welches ist gerade aktiv (Lichtorgel laeuft)?
+  char active_set = g.quer_active ? g.quer_set_name : 0;
 
-  // Quer-Overlay ueber den ganzen Mittelteil wenn aktiv
-  draw_quer_overlay(ctx);
+  int reihe_h = 22;
+  GRect rC = GRect(mid_x, y, mid_w, reihe_h);
+  draw_quer_reihe(ctx, rC, 'C', active_set == 'C', avail_set == 'C');
+  y += reihe_h + 2;
+  GRect rB = GRect(mid_x, y, mid_w, reihe_h);
+  draw_quer_reihe(ctx, rB, 'B', active_set == 'B', avail_set == 'B');
+  y += reihe_h + 2;
+  GRect rA = GRect(mid_x, y, mid_w, reihe_h);
+  draw_quer_reihe(ctx, rA, 'A', active_set == 'A', avail_set == 'A');
+  y += reihe_h + 2;
+
+  // Info-Zeile am Ende des Mittelteils
+  GRect iline = GRect(mid_x, y, mid_w, BODY_Y1 - y);
+  draw_info_line(ctx, iline);
 
   draw_footer(ctx);
 }
