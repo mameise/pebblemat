@@ -273,18 +273,8 @@ static uint32_t now_ms(void) {
   return (uint32_t)((s & 0xFFFFFF) * 1000U) + ms;
 }
 
-static int rng_int(int min_inclusive, int max_exclusive) {
-  // rand() ist im Pebble-SDK verfuegbar.
-  if (max_exclusive <= min_inclusive) return min_inclusive;
-  return min_inclusive + (rand() % (max_exclusive - min_inclusive));
-}
-
 static bool rng_chance(int percent) {
   return (rand() % 100) < percent;
-}
-
-static SymbolID strip_sample(const SymbolID *strip, int n) {
-  return strip[rand() % n];
 }
 
 static void message_set(const char *s, uint32_t ms_lifetime) {
@@ -1055,8 +1045,8 @@ static void draw_header(GContext *ctx) {
   graphics_context_set_text_color(ctx, GColorYellow);
   char buf[40];
   // Links: Münzspeicher
-  snprintf(buf, sizeof(buf), "%d.%02de",
-           g.muenzspeicher / 100, g.muenzspeicher % 100);
+  snprintf(buf, sizeof(buf), "%ld.%02lde",
+           (long)(g.muenzspeicher / 100), (long)(g.muenzspeicher % 100));
   graphics_draw_text(ctx, buf, f, GRect(2, 0, 80, HEADER_H),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   // Mitte: S/M/G
@@ -1206,7 +1196,8 @@ static void btn_select_click(ClickRecognizerRef rec, void *ctx) {
     // kurzes Feedback.)
     if (g.muenzspeicher > 0) {
       char buf[24];
-      snprintf(buf, sizeof(buf), "GUTH %d.%02d", g.muenzspeicher / 100, g.muenzspeicher % 100);
+      snprintf(buf, sizeof(buf), "GUTH %ld.%02ld",
+               (long)(g.muenzspeicher / 100), (long)(g.muenzspeicher % 100));
       message_set(buf, 1500);
     } else {
       message_set("KEIN GUTH", 1000);
