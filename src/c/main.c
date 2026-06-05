@@ -165,6 +165,7 @@ typedef enum {
   STATE_IDLE = 0,
   STATE_SPINNING,
   STATE_RISIKO,
+  STATE_KRONEN,    // Kronen-Risiko-Angebot (PDF 2.3f)
 } GameState;
 
 // Pfeile: bis zu 64 Stufen pro Seite => 64-bit Bitmasken reichen locker
@@ -189,9 +190,18 @@ typedef struct {
   char   risiko_seite;       // 'L' oder 'R' oder 0
   bool   risiko_can_teilen;
 
-  // Bonuspfeile-Bitmasken pro Stufe
+  // Bonuspfeile-Bitmasken pro Stufe (Verlust-Pfeile)
   uint64_t pfeile_links;
   uint64_t pfeile_rechts;
+  // Kronen-Pfeile (PDF 2.3f): aktueller Pfeil-Index pro Seite.
+  // -1 = "noch nie initialisiert" -> wird beim ersten Zugriff auf unterstes
+  // CENT-Feld gesetzt. Rotiert durch die CENT-Stufen wenn der Spieler
+  // ablehnt; springt auf unterste Stufe nach erfolgreichem Riskieren.
+  int8_t kronen_pfeil_l;
+  int8_t kronen_pfeil_r;
+  // Kronen-Risiko-Zustand: aktive Seite (0 wenn nicht aktiv)
+  char   kronen_seite;       // 'L' oder 'R' oder 0
+  uint16_t kronen_cent_grund; // 10 oder 20 (rote/gelbe Krone), Trostpreis
 
   // Quer-Lichtorgel
   bool  quer_active;
@@ -200,7 +210,8 @@ typedef struct {
   uint32_t quer_last_step_ms;
 
   // Speicher
-  int32_t muenzspeicher;     // Cent
+  int32_t muenzspeicher;     // Cent - aktuelles Spielguthaben (in der Maschine)
+  int32_t konto;             // Cent - externes Konto (Geldbeutel/Bank)
   int32_t sonderspiele;
   int32_t multispiele;
   int32_t gigaspiele;
@@ -260,6 +271,17 @@ static void risiko_verloren(void);
 static void reset_risiko_state(void);
 static const Stufe* current_leiter(int *n_out);
 static int8_t current_idx(void);
+static const Stufe* quer_set_items(char set_name, int *n_out);
+static void schedule_next_quer_step(void);
+static void kronen_starten(char seite, uint16_t cent_grund);
+static void kronen_annehmen(void);
+static void kronen_ablehnen(void);
+// Cent-/Kronen-Pfeil-Helfer (Implementierung weiter unten)
+static int8_t cent_top_idx(const Stufe *l, int n);
+static int8_t cent_bottom_idx(const Stufe *l, int n);
+static int8_t cent_next_higher(const Stufe *l, int n, int8_t idx);
+static int8_t kronen_pfeil_idx(char seite);
+static void set_kronen_pfeil_idx(char seite, int8_t idx);
 
 // ============================================================
 // Util
@@ -287,8 +309,10 @@ static void message_set(const char *s, uint32_t ms_lifetime) {
 // ============================================================
 #define PKEY_BLOB 1
 #define PKEY_VERSION 2
-#define SAVE_VERSION 1
+#define SAVE_VERSION 3
 
+// Save-Blob V3: konto (externes Geldbeutel-Konto) statt auszahlung_total.
+// V2-Save (mit auszahlung_total) wird beim Laden ignoriert (fresh start).
 typedef struct {
   uint32_t version;
   int32_t muenzspeicher;
@@ -299,6 +323,9 @@ typedef struct {
   uint64_t pfeile_rechts;
   int32_t stats_spiele;
   int32_t stats_gewinne;
+  int32_t konto;             // V3
+  int8_t  kronen_pfeil_l;    // V3: aktueller Kronen-Pfeil-Index links
+  int8_t  kronen_pfeil_r;    // V3: aktueller Kronen-Pfeil-Index rechts
 } SaveBlob;
 
 static void state_save(void) {
@@ -312,6 +339,9 @@ static void state_save(void) {
   b.pfeile_rechts = g.pfeile_rechts;
   b.stats_spiele = g.stats_spiele;
   b.stats_gewinne = g.stats_gewinne;
+  b.konto = g.konto;
+  b.kronen_pfeil_l = g.kronen_pfeil_l;
+  b.kronen_pfeil_r = g.kronen_pfeil_r;
   persist_write_data(PKEY_BLOB, &b, sizeof(b));
 }
 
@@ -328,6 +358,9 @@ static void state_load(void) {
   g.pfeile_rechts = b.pfeile_rechts;
   g.stats_spiele = b.stats_spiele;
   g.stats_gewinne = b.stats_gewinne;
+  g.konto = b.konto;
+  g.kronen_pfeil_l = b.kronen_pfeil_l;
+  g.kronen_pfeil_r = b.kronen_pfeil_r;
 }
 
 // ============================================================
@@ -339,6 +372,11 @@ static void state_init(void) {
   g.risiko_left_idx = -1;
   g.risiko_right_idx = -1;
   g.serie_mode = 'n';
+  // Kronen-Pfeile starten am untersten CENT-Feld (siehe init_kronen_pfeile)
+  g.kronen_pfeil_l = -1;
+  g.kronen_pfeil_r = -1;
+  // Start-Konto: 10 EUR Startguthaben
+  g.konto = 1000;
   strcpy(g.message, "A=START");
   // Reels mit Default-Symbolen
   g.reel_l[0] = SYM_40C; g.reel_l[1] = SYM_20C;
@@ -361,11 +399,20 @@ static void start_spiel(void) {
     message_set("MUENZE FEHLT", 1200);
     return;
   }
-  // Modus bestimmen
-  if (g.gigaspiele > 0) { g.gigaspiele--; g.serie_mode = 'g'; }
-  else if (g.multispiele > 0) { g.multispiele--; g.serie_mode = 'm'; }
-  else if (g.sonderspiele > 0) { g.sonderspiele--; g.serie_mode = 's'; }
-  else { g.muenzspeicher -= EINSATZ; g.serie_mode = 'n'; }
+  // Modus bestimmen (gemaess PDF 2.3a):
+  // - Gigaspiele werden vorrangig abgespielt, aber NUR wenn der
+  //   Sonder-/Multispielezaehler nicht mehr als 101 Spiele zeigt
+  // - sonst: Multi vor Sonder vor Muenzeinsatz
+  int sm = g.sonderspiele + g.multispiele;
+  if (g.gigaspiele > 0 && sm <= 101) {
+    g.gigaspiele--; g.serie_mode = 'g';
+  } else if (g.multispiele > 0) {
+    g.multispiele--; g.serie_mode = 'm';
+  } else if (g.sonderspiele > 0) {
+    g.sonderspiele--; g.serie_mode = 's';
+  } else {
+    g.muenzspeicher -= EINSATZ; g.serie_mode = 'n';
+  }
 
   reset_risiko_state();
   // Walzen-Spin starten
@@ -450,16 +497,137 @@ static LineWin eval_line(SymbolID a, SymbolID m, SymbolID b, int line_idx) {
   return w;
 }
 
+// Hilfsfunktion: Auto-Auszahlung wenn Muenzspeicher zu hoch
+static void check_auto_auszahl(void) {
+  // PDF 1.2: Normal > 25,- EUR  oder Serie > 165,- EUR -> 4 EUR raus
+  // (ins externe Konto)
+  bool serie = (g.serie_mode != 'n');
+  int32_t limit = serie ? 16500 : 2500;
+  if (g.muenzspeicher > limit) {
+    g.muenzspeicher -= 400;
+    g.konto += 400;
+    message_set("AUSZ 4.00 E", 1500);
+  }
+}
+
+// Mystery-Ausspielung (PDF 2.3c): zwischen 4 Feldern auswuerfeln
+// Feld 170c (links oben CENT-Bereich), 120c (rechts oben CENT-Bereich),
+// GIGA AUSSPIELUNG (12/24/50 Multispiele) und MULTI AUSSPIELUNG.
+// Gewichtung pragmatisch.
+static void mystery_ausspielung(void) {
+  int r = rand() % 100;
+  if (r < 30) {
+    g.muenzspeicher += 170;
+    message_set("MYST 1.70E", 1500);
+  } else if (r < 60) {
+    g.muenzspeicher += 120;
+    message_set("MYST 1.20E", 1500);
+  } else if (r < 85) {
+    int mm = (r < 75) ? 12 : (r < 82 ? 24 : 50);
+    if (g.sonderspiele > 0) { mm += g.sonderspiele; g.sonderspiele = 0; }
+    g.multispiele += mm;
+    char b[24];
+    snprintf(b, sizeof(b), "MYST GIGA +%dM", mm);
+    message_set(b, 1500);
+  } else {
+    int mm = 12;
+    if (g.sonderspiele > 0) { mm += g.sonderspiele; g.sonderspiele = 0; }
+    g.multispiele += mm;
+    char b[24];
+    snprintf(b, sizeof(b), "MYST MULTI +%dM", mm);
+    message_set(b, 1500);
+  }
+}
+
+// Giga-Zusatz: zwischen 12 und 50 Multispiele bei Giga-Gewinn (PDF 2.3a)
+static void giga_zusatz(void) {
+  // 12/24/50 gewichtet 6/3/1
+  int r = rand() % 10;
+  int mm = (r < 6) ? 12 : (r < 9 ? 24 : 50);
+  if (g.sonderspiele > 0) { mm += g.sonderspiele; g.sonderspiele = 0; }
+  g.multispiele += mm;
+}
+
+// Prueft ob im aktuellen Serienspiel auf der gefundenen Cent-Stufe
+// ueberhaupt riskiert werden darf (PDF 2.3e)
+static bool risikable_in_serie(uint16_t cent, bool spezial, bool krone_in_mitte) {
+  if (g.serie_mode == 'n') return true;  // Normalspiel: alles riskierbar
+  if (g.serie_mode == 'g') return false; // Gigaspiele: gar nicht
+  // Sonder/Multi: nur bei Spezial-Kombi oder Krone/10c/20c in Mitte
+  if (spezial || krone_in_mitte) return true;
+  // In Sonderspielen zusaetzlich nur bei Sonderspielezaehler <= 9
+  if (g.serie_mode == 's' && g.sonderspiele <= 9) return true;
+  return false;
+}
+
 static void evaluate_spin(void) {
   apply_final_reels();
   LineWin a = eval_line(g.reel_l[0], g.reel_m[0], g.reel_r[0], 0);
   LineWin b = eval_line(g.reel_l[1], g.reel_m[0], g.reel_r[1], 1);
   LineWin best = (a.cent >= b.cent) ? a : b;
-  if (best.cent == 0) {
+  bool win = (best.cent > 0);
+
+  // === Serie: bei Gewinn 2 EUR + ggf. Giga-Zusatz ===
+  if (win && g.serie_mode != 'n') {
+    g.muenzspeicher += 200;  // 2 EUR
+    if (g.serie_mode == 'g') {
+      giga_zusatz();
+      char buf[24];
+      snprintf(buf, sizeof(buf), "GIGA +2E +M");
+      message_set(buf, 1500);
+    } else {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "SERIE +2E");
+      message_set(buf, 1500);
+    }
+    g.stats_gewinne++;
+    vibes_short_pulse();
+    g.state = STATE_IDLE;
+    check_auto_auszahl();
+    return;
+  }
+  // In Gigaspielen ohne Treffer -> Mystery (PDF 2.3a)
+  if (!win && g.serie_mode == 'g') {
+    mystery_ausspielung();
+    g.state = STATE_IDLE;
+    check_auto_auszahl();
+    return;
+  }
+  // Im Multi/Sonder ohne Treffer: einfach kein Gewinn
+  if (!win && g.serie_mode != 'n') {
+    g.state = STATE_IDLE;
+    message_set("-", 800);
+    return;
+  }
+
+  // === Normalspiel ===
+  bool krone_rot = (g.reel_m[0] == SYM_K_ROT);
+  bool krone_gelb = (g.reel_m[0] == SYM_K_GELB);
+  bool krone_in_mitte = krone_rot || krone_gelb;
+
+  if (!win) {
+    // Krone in Mitte ohne Liniengewinn -> direkt Kronen-Risiko anbieten
+    if (krone_in_mitte) {
+      kronen_starten(krone_rot ? 'L' : 'R', krone_rot ? 10 : 20);
+      return;
+    }
     g.state = STATE_IDLE;
     message_set("KEIN GEWINN", 1500);
     return;
   }
+
+  // Riskierbarkeit in Serie pruefen (hier nur Normalspiel uebrig)
+  if (!risikable_in_serie(best.cent, best.spezial, krone_in_mitte)) {
+    // direkt cash
+    g.muenzspeicher += best.cent;
+    g.state = STATE_IDLE;
+    char buf[24];
+    snprintf(buf, sizeof(buf), "+%d c", best.cent);
+    message_set(buf, 1500);
+    check_auto_auszahl();
+    return;
+  }
+
   // Risiko anbieten: passende Stufen in den Leitern finden
   int8_t li = -1, ri = -1;
   for (uint8_t i = 0; i < LEITER_LINKS_N; i++) {
@@ -479,8 +647,19 @@ static void evaluate_spin(void) {
     char buf[24];
     snprintf(buf, sizeof(buf), "+%d c", best.cent);
     message_set(buf, 1500);
+    check_auto_auszahl();
     return;
   }
+
+  // Wenn Krone in Mitte UND Liniengewinn: erst Krone (Kronen-Risiko hat
+  // Vorrang weil charakteristisch fuer den 493). Liniengewinn wird gut-
+  // geschrieben.
+  if (krone_in_mitte) {
+    g.muenzspeicher += best.cent;
+    kronen_starten(krone_rot ? 'L' : 'R', krone_rot ? 10 : 20);
+    return;
+  }
+
   risiko_starten(li, ri, best.line, best.cent);
 }
 
@@ -535,6 +714,105 @@ static void risiko_starten(int8_t left_idx, int8_t right_idx, int line_idx, uint
   message_set(buf, 60000);
 }
 
+// ============================================================
+// Kronen-Risiko (PDF 2.3f)
+// ============================================================
+// Bei roter/gelber Krone in der Mitte (ausserhalb Serie) wird dem Spieler
+// der Wert des Felds NEBEN dem aktuell erleuchteten Kronen-Pfeil zum
+// Risiko angeboten. Annehmen -> 1:1 von dieser Stufe aus. Ablehnen ->
+// 10c/20c als Trostpreis (60c/80c falls Pfeil auf 1.20/1.70 stand!),
+// Pfeil rueckt eine Stufe hoch. Bei oberster Stufe bleibt der Pfeil dort
+// bis erfolgreich riskiert wird, dann reset auf unterste Stufe.
+
+static void kronen_starten(char seite, uint16_t cent_grund) {
+  g.kronen_seite = seite;
+  g.kronen_cent_grund = cent_grund;
+  g.state = STATE_KRONEN;
+  // Pfeil-Init wird durch kronen_pfeil_idx automatisch erledigt (Default = unterstes Feld)
+  const Stufe *l = (seite == 'L') ? LEITER_LINKS : LEITER_RECHTS;
+  int8_t idx = kronen_pfeil_idx(seite);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "KRONE %c: %dc?",
+           (seite == 'L' ? 'L' : 'R'), l[idx].val);
+  message_set(buf, 60000);
+}
+
+// Pruefe ob der Kronen-Pfeil aktuell auf der hoechsten CENT-Stufe steht
+static bool kronen_pfeil_ist_hoechste(char seite) {
+  const Stufe *l = (seite == 'L') ? LEITER_LINKS : LEITER_RECHTS;
+  int n = (seite == 'L') ? LEITER_LINKS_N : LEITER_RECHTS_N;
+  int8_t top = cent_top_idx(l, n);
+  return kronen_pfeil_idx(seite) == top;
+}
+
+static void kronen_annehmen(void) {
+  if (g.state != STATE_KRONEN) return;
+  char seite = g.kronen_seite;
+  int8_t idx = kronen_pfeil_idx(seite);
+  // Direkt 1:1-Risiko von dieser Stufe starten.
+  g.risiko_seite = seite;
+  if (seite == 'L') { g.risiko_left_idx = idx; g.risiko_right_idx = -1; }
+  else { g.risiko_right_idx = idx; g.risiko_left_idx = -1; }
+  // Pfeil-Skip beim Einstieg
+  bonuspfeil_check(seite, idx);
+  int n; const Stufe *l = current_leiter(&n);
+  int8_t cur = current_idx();
+  if (cur < 0 || l[cur].typ == ST_NULL) {
+    g.muenzspeicher += g.kronen_cent_grund;
+    g.kronen_seite = 0;
+    g.kronen_cent_grund = 0;
+    g.state = STATE_IDLE;
+    char buf[24];
+    snprintf(buf, sizeof(buf), "+%dc", g.kronen_cent_grund);
+    message_set(buf, 1500);
+    check_auto_auszahl();
+    return;
+  }
+  Stufe st = l[cur];
+  g.risiko_can_teilen = teilbar(st.typ, st.val, cur, seite);
+  g.state = STATE_RISIKO;
+  // Kronen-Pfeil bleibt wo er ist - wird in risiko_stopp/teilen-Pfad
+  // beim erfolgreichen Riskieren auf die unterste Stufe zurueckgesetzt.
+  g.kronen_cent_grund = 0;
+  message_set("RISIKO!", 1000);
+}
+
+static void kronen_ablehnen(void) {
+  if (g.state != STATE_KRONEN) return;
+  char seite = g.kronen_seite;
+  uint16_t grund = g.kronen_cent_grund;  // 10 oder 20
+  const Stufe *l = (seite == 'L') ? LEITER_LINKS : LEITER_RECHTS;
+  int n = (seite == 'L') ? LEITER_LINKS_N : LEITER_RECHTS_N;
+  int8_t pfeil = kronen_pfeil_idx(seite);
+
+  // Spezial-Trostregel (PDF 2.3f):
+  // "Wurden 10 Cent bzw. 20 Cent zu mindestens 1,20 EUR bzw. 1,70 EUR
+  //  angeboten und nicht riskiert, wird der Gewinn auf 60 Cent bzw.
+  //  80 Cent erhoeht."
+  uint16_t trost = grund;
+  uint16_t schwelle = (grund == 10) ? 120 : 170;
+  if (l[pfeil].val >= schwelle) {
+    trost = (grund == 10) ? 60 : 80;
+  }
+  g.muenzspeicher += trost;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "ABGELEHNT +%dc", trost);
+  message_set(buf, 1500);
+
+  // Pfeil hochsetzen (eine CENT-Stufe hoeher)
+  int8_t naechst = cent_next_higher(l, n, pfeil);
+  if (naechst >= 0) {
+    set_kronen_pfeil_idx(seite, naechst);
+  }
+  // Bei hoechster Stufe: Pfeil bleibt (keine hoehere Stufe)
+
+  g.kronen_seite = 0;
+  g.kronen_cent_grund = 0;
+  g.state = STATE_IDLE;
+  check_auto_auszahl();
+  (void)kronen_pfeil_ist_hoechste;  // ggf spaeter verwendet
+}
+
 static const Stufe* current_leiter(int *n_out) {
   if (g.risiko_seite == 'L') {
     if (n_out) *n_out = LEITER_LINKS_N;
@@ -553,6 +831,39 @@ static int8_t current_idx(void) {
 static void set_current_idx(int8_t v) {
   if (g.risiko_seite == 'L') g.risiko_left_idx = v;
   else if (g.risiko_seite == 'R') g.risiko_right_idx = v;
+}
+
+// Finde hoechsten / niedrigsten CENT-Index in einer Leiter
+static int8_t cent_top_idx(const Stufe *l, int n) {
+  for (int i = 0; i < n; i++) if (l[i].typ == ST_CENT) return i;
+  return -1;
+}
+static int8_t cent_bottom_idx(const Stufe *l, int n) {
+  int8_t last = -1;
+  for (int i = 0; i < n; i++) if (l[i].typ == ST_CENT) last = i;
+  return last;
+}
+// Naechsthoeherer CENT-Index ueber idx (oder -1 wenn keiner mehr)
+static int8_t cent_next_higher(const Stufe *l, int n, int8_t idx) {
+  for (int i = idx - 1; i >= 0; i--) if (l[i].typ == ST_CENT) return i;
+  return -1;
+}
+
+// Aktueller Kronen-Pfeil-Index pro Seite (mit Default = unterste CENT-Stufe)
+static int8_t kronen_pfeil_idx(char seite) {
+  if (seite == 'L') {
+    if (g.kronen_pfeil_l < 0)
+      return cent_bottom_idx(LEITER_LINKS, LEITER_LINKS_N);
+    return g.kronen_pfeil_l;
+  } else {
+    if (g.kronen_pfeil_r < 0)
+      return cent_bottom_idx(LEITER_RECHTS, LEITER_RECHTS_N);
+    return g.kronen_pfeil_r;
+  }
+}
+static void set_kronen_pfeil_idx(char seite, int8_t idx) {
+  if (seite == 'L') g.kronen_pfeil_l = idx;
+  else g.kronen_pfeil_r = idx;
 }
 
 static bool teilbar(StufenTyp t, uint16_t v, int8_t idx, char seite) {
@@ -708,7 +1019,18 @@ static void risiko_stopp(void) {
     vibes_short_pulse();
   }
   reset_risiko_state();
+  // Kronen-Pfeil-Reset: nach erfolgreichem Riskieren springt der Kronen-Pfeil
+  // auf das unterste CENT-Feld zurueck (PDF 2.3f).
+  char seite = (g.risiko_seite == 'L') ? 'L' : (g.risiko_seite == 'R' ? 'R' : 0);
+  (void)seite;
+  // (g.risiko_seite ist hier schon reset, deshalb merken wir uns die Seite
+  //  ueber den Kronen-Pfeil-Index nur indirekt - vereinfacht: wir setzen
+  //  BEIDE Pfeile zurueck wenn ein Risiko-Stopp erfolgreich war.)
+  // Reset Kronen-Pfeile auf unterstes Feld
+  g.kronen_pfeil_l = cent_bottom_idx(LEITER_LINKS, LEITER_LINKS_N);
+  g.kronen_pfeil_r = cent_bottom_idx(LEITER_RECHTS, LEITER_RECHTS_N);
   g.state = STATE_IDLE;
+  check_auto_auszahl();
 }
 
 static void risiko_teilen(void) {
@@ -720,25 +1042,39 @@ static void risiko_teilen(void) {
   Stufe st = l[cur];
   if (st.typ == ST_AUS || st.typ == ST_NULL) return;
   if (st.typ == ST_CENT && st.val <= 20) return;
-  uint16_t half = st.val / 2;
+
+  // Naechstniedrige Stufe gleichen Typs finden (PDF 2.4)
   int8_t new_idx = cur + 1;
-  while (new_idx < n && (l[new_idx].typ == ST_AUS || l[new_idx].typ == ST_NULL)) {
-    new_idx++;
+  while (new_idx < n) {
+    StufenTyp t2 = l[new_idx].typ;
+    if (t2 == st.typ) break;
+    if (t2 == ST_AUS || t2 == ST_NULL) { new_idx++; continue; }
+    // Anderer Typ -> abbrechen (kein matching tieferes Feld)
+    new_idx = n;
+    break;
   }
   if (new_idx >= n) {
-    // nichts darunter, einfach gutschreiben
-    if (half > 0) gutschreiben(st.typ, half);
+    // Keine niedrigere Stufe gleichen Typs -> alles cash und Ende
+    gutschreiben(st.typ, st.val);
     reset_risiko_state();
     g.state = STATE_IDLE;
-    message_set("TEIL+ENDE", 1500);
+    message_set("TEIL ENDE", 1500);
     return;
   }
-  if (half > 0) gutschreiben(st.typ, half);
+  // Differenz gutschreiben, auf neue Stufe springen, Risiko weiter
+  uint16_t diff = (st.val > l[new_idx].val) ? (st.val - l[new_idx].val) : 0;
+  if (diff > 0) gutschreiben(st.typ, diff);
   set_current_idx(new_idx);
   Stufe nx = l[new_idx];
   g.risiko_can_teilen = teilbar(nx.typ, nx.val, new_idx, g.risiko_seite);
   char buf[24];
-  snprintf(buf, sizeof(buf), "TEIL +%d", half);
+  switch (st.typ) {
+    case ST_CENT:  snprintf(buf, sizeof(buf), "TEIL +%dc", diff); break;
+    case ST_SP:    snprintf(buf, sizeof(buf), "TEIL +%d SP", diff); break;
+    case ST_MULTI: snprintf(buf, sizeof(buf), "TEIL +%d M", diff); break;
+    case ST_GIGA:  snprintf(buf, sizeof(buf), "TEIL +%d G", diff); break;
+    default:       snprintf(buf, sizeof(buf), "TEIL +%d", diff); break;
+  }
   message_set(buf, 1500);
 }
 
@@ -759,8 +1095,13 @@ static void quer_start_action(void) {
   if (set == 0) return;
   g.quer_active = true;
   g.quer_set_name = set;
-  g.quer_pos = 0;
+  // Zufaelliger Startindex damit das Timing nicht vorhersehbar wird
+  int qn;
+  const Stufe *items = quer_set_items(set, &qn);
+  (void)items;
+  g.quer_pos = (qn > 0) ? (rand() % qn) : 0;
   g.quer_last_step_ms = now_ms();
+  schedule_next_quer_step();
   message_set("QUER!", 1000);
 }
 
@@ -811,15 +1152,31 @@ static void update_spinning(void) {
   }
 }
 
+// Quer-Lichtorgel: das Intervall zwischen Schritten variiert zufaellig.
+// Zusaetzlich macht das Licht gelegentlich Spruenge (statt nur 1 Position).
+// Damit ist nicht vorhersehbar, wo es stoppt wenn der Spieler B drueckt.
+static uint32_t g_next_quer_interval = 150;
+static void schedule_next_quer_step(void) {
+  // 80..280 ms (sehr schnell bis langsam)
+  g_next_quer_interval = 80 + (rand() % 200);
+}
+
 static void update_quer(void) {
   uint32_t t = now_ms();
-  if (t - g.quer_last_step_ms > 180) {
+  if (t - g.quer_last_step_ms >= g_next_quer_interval) {
     int qn;
     const Stufe *items = quer_set_items(g.quer_set_name, &qn);
     if (qn > 0 && items != NULL) {
-      g.quer_pos = (g.quer_pos + 1) % qn;
+      // 75% einen Schritt, 20% zwei Schritte, 5% drei Schritte
+      int r = rand() % 100;
+      int steps;
+      if (r < 75) steps = 1;
+      else if (r < 95) steps = 2;
+      else steps = 3;
+      g.quer_pos = (g.quer_pos + steps) % qn;
     }
     g.quer_last_step_ms = t;
+    schedule_next_quer_step();
   }
 }
 
@@ -886,7 +1243,8 @@ static GColor stufe_text_color(StufenTyp t) {
 
 // Zeichnet eine Risiko-Leiter (links oder rechts)
 static void draw_leiter(GContext *ctx, GRect bounds, const Stufe *leiter, int n,
-                        int8_t cur_idx, uint64_t pfeile, bool seite_is_left) {
+                        int8_t cur_idx, uint64_t pfeile, bool seite_is_left,
+                        int8_t kronen_pf) {
   graphics_context_set_fill_color(ctx, GColorOxfordBlue);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
@@ -943,6 +1301,21 @@ static void draw_leiter(GContext *ctx, GRect bounds, const Stufe *leiter, int n,
         gpath_draw_filled(ctx, path);
         gpath_destroy(path);
       }
+    }
+
+    // Kronen-Pfeil-Marker: kleines "K" in Ecke der aktuellen Krone-Pfeil-Stufe
+    if (i == kronen_pf && st.typ == ST_CENT) {
+      GColor kcol = g.flash ? GColorYellow : GColorOrange;
+      // kleines gefuelltes Rechteck mit "K" drauf
+      int kw = 8, kh = 8;
+      int kx = seite_is_left ? r.origin.x + 1 : r.origin.x + r.size.w - kw - 1;
+      int ky = r.origin.y + 1;
+      graphics_context_set_fill_color(ctx, kcol);
+      graphics_fill_rect(ctx, GRect(kx, ky, kw, kh), 1, GCornersAll);
+      graphics_context_set_text_color(ctx, GColorBlack);
+      graphics_draw_text(ctx, "K", f, GRect(kx, ky - 2, kw, kh + 2),
+                         GTextOverflowModeTrailingEllipsis,
+                         GTextAlignmentCenter, NULL);
     }
 
     // Label
@@ -1067,6 +1440,9 @@ static void draw_footer(GContext *ctx) {
       if (g.risiko_can_teilen) bC = (quer_set_for_current() ? "TEI/QER" : "TEILEN");
       else if (quer_set_for_current()) bC = "QUER";
     }
+  } else if (g.state == STATE_KRONEN) {
+    bA = "NEHMEN";
+    bB = "ABLEHN";
   }
   graphics_context_set_text_color(ctx, GColorYellow);
   char line[40];
@@ -1163,19 +1539,31 @@ static void draw_info_line(GContext *ctx, GRect bounds) {
         strcpy(buf, "Risiko");
       }
     }
+  } else if (g.state == STATE_KRONEN) {
+    // Kronen-Risiko-Angebot
+    const Stufe *l = (g.kronen_seite == 'L') ? LEITER_LINKS : LEITER_RECHTS;
+    int8_t pf = kronen_pfeil_idx(g.kronen_seite);
+    if (pf >= 0) {
+      snprintf(buf, sizeof(buf), "KRONE %c: %d c?",
+               g.kronen_seite, l[pf].val);
+    } else {
+      strcpy(buf, "KRONE-RISIKO");
+    }
+    col = GColorOrange;
   } else if (g.state == STATE_SPINNING) {
     strcpy(buf, "SPIN - B = STOP");
     col = GColorChromeYellow;
   } else {
-    // Idle: Message oder Statistik
+    // Idle: Message oder Konto-Stand
     uint32_t t = now_ms();
     if (g.message[0] && t < g.message_until) {
       strncpy(buf, g.message, sizeof(buf) - 1);
       buf[sizeof(buf) - 1] = 0;
     } else {
-      snprintf(buf, sizeof(buf), "%ld Spiele / %ld Gew.",
-               (long)g.stats_spiele, (long)g.stats_gewinne);
-      col = GColorLightGray;
+      snprintf(buf, sizeof(buf), "Konto: %ld.%02ld EUR",
+               (long)(g.konto / 100),
+               (long)(g.konto % 100));
+      col = (g.konto < 100) ? GColorRed : GColorChromeYellow;
     }
   }
 
@@ -1195,9 +1583,11 @@ static void main_layer_update(Layer *layer, GContext *ctx) {
   GRect lr = GRect(0, BODY_Y0, LEITER_W, BODY_H);
   GRect rr = GRect(SCR_W - LEITER_W, BODY_Y0, LEITER_W, BODY_H);
   draw_leiter(ctx, lr, LEITER_LINKS, LEITER_LINKS_N,
-              g.risiko_left_idx, g.pfeile_links, true);
+              g.risiko_left_idx, g.pfeile_links, true,
+              kronen_pfeil_idx('L'));
   draw_leiter(ctx, rr, LEITER_RECHTS, LEITER_RECHTS_N,
-              g.risiko_right_idx, g.pfeile_rechts, false);
+              g.risiko_right_idx, g.pfeile_rechts, false,
+              kronen_pfeil_idx('R'));
 
   // Mittelteil-Layout:
   //   Walzen kompakt oben (~60px)
@@ -1252,6 +1642,8 @@ static void btn_up_click(ClickRecognizerRef rec, void *ctx) {
     start_spiel();
   } else if (g.state == STATE_RISIKO && !g.quer_active) {
     risiko_1zu1();
+  } else if (g.state == STATE_KRONEN) {
+    kronen_annehmen();
   }
   redraw();
 }
@@ -1259,14 +1651,16 @@ static void btn_up_click(ClickRecognizerRef rec, void *ctx) {
 static void btn_select_click(ClickRecognizerRef rec, void *ctx) {
   (void)rec; (void)ctx;
   if (g.state == STATE_IDLE) {
-    // Auszahlen (vereinfacht: Muenzspeicher cash bleibt — wir haben keine
-    // Tasche separat, der Speicher ist die "Tasche". Aktion macht ein
-    // kurzes Feedback.)
+    // Voll-Auszahlung: ganzer Muenzspeicher in den Highscore-Zaehler
     if (g.muenzspeicher > 0) {
+      int32_t amount = g.muenzspeicher;
+      g.konto += amount;
+      g.muenzspeicher = 0;
       char buf[24];
-      snprintf(buf, sizeof(buf), "GUTH %ld.%02ld",
-               (long)(g.muenzspeicher / 100), (long)(g.muenzspeicher % 100));
-      message_set(buf, 1500);
+      snprintf(buf, sizeof(buf), "AUS %ld.%02ld E",
+               (long)(amount / 100), (long)(amount % 100));
+      message_set(buf, 2000);
+      vibes_short_pulse();
     } else {
       message_set("KEIN GUTH", 1000);
     }
@@ -1278,6 +1672,23 @@ static void btn_select_click(ClickRecognizerRef rec, void *ctx) {
     } else {
       risiko_stopp();
     }
+  } else if (g.state == STATE_KRONEN) {
+    kronen_ablehnen();
+  }
+  redraw();
+}
+
+// SELECT lang im Idle: Konto auffuellen, aber nur wenn unter 1 EUR
+static void btn_select_long_click(ClickRecognizerRef rec, void *ctx) {
+  (void)rec; (void)ctx;
+  if (g.state == STATE_IDLE) {
+    if (g.konto < 100) {
+      g.konto += 1000;  // 10 EUR
+      message_set("AUFGELADEN +10E", 1500);
+      vibes_short_pulse();
+    } else {
+      message_set("KONTO OK", 1000);
+    }
   }
   redraw();
 }
@@ -1286,9 +1697,14 @@ static void btn_down_click(ClickRecognizerRef rec, void *ctx) {
   (void)rec; (void)ctx;
   // Kurzer Press auf DOWN
   if (g.state == STATE_IDLE) {
-    // Muenze einwerfen (1 Euro)
-    g.muenzspeicher += 100;
-    message_set("+1.00 EUR", 800);
+    // Muenze einwerfen: 1 Euro aus Konto in Muenzspeicher
+    if (g.konto >= 100) {
+      g.konto -= 100;
+      g.muenzspeicher += 100;
+      message_set("+1.00 EUR", 800);
+    } else {
+      message_set("KONTO LEER!", 1500);
+    }
   } else if (g.state == STATE_RISIKO && !g.quer_active) {
     if (g.risiko_can_teilen) risiko_teilen();
   }
@@ -1311,6 +1727,8 @@ static void click_config_provider(void *ctx) {
   window_single_click_subscribe(BUTTON_ID_DOWN, btn_down_click);
   // Long-Press DOWN fuer Quer-Spiel (600ms)
   window_long_click_subscribe(BUTTON_ID_DOWN, 600, btn_down_long_click, NULL);
+  // Long-Press SELECT fuer Konto-Auflader (800ms)
+  window_long_click_subscribe(BUTTON_ID_SELECT, 800, btn_select_long_click, NULL);
 }
 
 // ============================================================
