@@ -1,0 +1,25 @@
+{
+  "name": "slot493",
+  "author": "Bernd",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Bally 493",
+    "uuid": "f7e3a2c9-4b8d-4c15-9e7f-2d3a8b5c1e94",
+    "sdkVersion": "3",
+    "targetPlatforms": [
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [],
+    "resources": {
+      "media": []
+    },
+    "capabilities": [],
+    "projectType": "native"
+  }
+}
