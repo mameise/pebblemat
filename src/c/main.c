@@ -132,29 +132,38 @@ static const MysteryOpt MYSTERY_OPTS[] = {
 };
 #define MYSTERY_OPTS_N (sizeof(MYSTERY_OPTS)/sizeof(MYSTERY_OPTS[0]))
 
-// Walzen-Streifen: Verteilung der Symbole. Walze 0 (links), 1 (mitte),
-// 2 (rechts). Mitte hat 1 sichtbares Symbol, links/rechts 2.
-// Wir bauen "Strips" - Sequenzen aus denen wir zufaellig samplen.
-// Gewichtung an Originalmechanik angelehnt (haeufige Cent, seltene Kronen).
+// Walzen-Streifen: Verteilung der Symbole.
+//
+// Konzept:
+// - Strip 0 (links) und Strip 2 (rechts) tragen die Hauptlast der CENT-
+//   Treffer (3x dasselbe). Beide haben aehnliche Cent-Verteilung.
+// - Strip 1 (Mitte) hat moderat Kronen (loesen direkt 10c/20c aus) und
+//   alle CENT-Werte. Karierte Felder sind selten, kommen aber vor.
+// - 4-9-3 Spezial-Kombi: 4 nur auf Strip 0, 9 nur auf Strip 1, 3 nur
+//   auf Strip 2 (sehr seltene Konstellation).
+// - SYM_BLANK gibt es NICHT - jedes sichtbare Feld ist ein echtes Symbol.
+
 static const SymbolID STRIP_0[] = {
-  SYM_10C, SYM_BLANK, SYM_40C, SYM_BLANK, SYM_K_ROT, SYM_20C, SYM_4,
-  SYM_80C, SYM_BLANK, SYM_40C, SYM_3, SYM_170C, SYM_BLANK,
-  SYM_20C, SYM_K_GELB, SYM_KARIERT, SYM_40C, SYM_BLANK, SYM_120C,
-  SYM_9, SYM_BLANK, SYM_80C, SYM_K_ROT, SYM_30C, SYM_60C
+  SYM_40C, SYM_20C, SYM_10C, SYM_40C, SYM_80C, SYM_30C, SYM_K_ROT,
+  SYM_40C, SYM_60C, SYM_4, SYM_20C, SYM_170C, SYM_40C, SYM_80C,
+  SYM_KARIERT, SYM_40C, SYM_30C, SYM_120C, SYM_40C, SYM_20C, SYM_10C,
+  SYM_K_GELB, SYM_60C, SYM_30C, SYM_40C
 };
 #define STRIP_0_N (sizeof(STRIP_0)/sizeof(STRIP_0[0]))
 
 static const SymbolID STRIP_1[] = {
-  SYM_K_ROT, SYM_BLANK, SYM_20C, SYM_K_GELB, SYM_BLANK, SYM_40C, SYM_9,
-  SYM_KARIERT, SYM_K_ROT, SYM_BLANK, SYM_30C, SYM_K_GELB, SYM_BLANK,
-  SYM_60C, SYM_K_ROT, SYM_BLANK, SYM_K_GELB, SYM_20C, SYM_BLANK
+  SYM_40C, SYM_20C, SYM_K_ROT, SYM_30C, SYM_80C, SYM_K_GELB, SYM_60C,
+  SYM_9, SYM_40C, SYM_K_ROT, SYM_10C, SYM_30C, SYM_120C, SYM_40C,
+  SYM_K_GELB, SYM_60C, SYM_KARIERT, SYM_30C, SYM_K_ROT, SYM_40C, SYM_80C,
+  SYM_170C, SYM_K_GELB, SYM_10C
 };
 #define STRIP_1_N (sizeof(STRIP_1)/sizeof(STRIP_1[0]))
 
 static const SymbolID STRIP_2[] = {
-  SYM_10C, SYM_30C, SYM_BLANK, SYM_60C, SYM_K_GELB, SYM_3, SYM_120C,
-  SYM_BLANK, SYM_10C, SYM_K_ROT, SYM_30C, SYM_BLANK, SYM_60C, SYM_4,
-  SYM_KARIERT, SYM_120C, SYM_BLANK, SYM_30C, SYM_K_GELB, SYM_10C
+  SYM_30C, SYM_40C, SYM_60C, SYM_20C, SYM_40C, SYM_10C, SYM_3,
+  SYM_40C, SYM_120C, SYM_K_ROT, SYM_60C, SYM_30C, SYM_40C, SYM_80C,
+  SYM_KARIERT, SYM_20C, SYM_120C, SYM_40C, SYM_60C, SYM_K_GELB,
+  SYM_30C, SYM_170C, SYM_80C, SYM_60C, SYM_10C
 };
 #define STRIP_2_N (sizeof(STRIP_2)/sizeof(STRIP_2[0]))
 
@@ -462,7 +471,7 @@ static void apply_final_reels(void) {
 // Bewertet die zwei Gewinn-Linien
 // Linie A oben: (reel_l[0], reel_m[0], reel_r[0])
 // Linie B unten: (reel_l[1], reel_m[0], reel_r[1])
-typedef struct { uint16_t cent; bool spezial; int line; } LineWin;
+typedef struct { uint16_t cent; bool spezial; bool kariert; int line; } LineWin;
 
 static int sym_cent(SymbolID s) {
   switch (s) {
@@ -479,7 +488,11 @@ static int sym_cent(SymbolID s) {
 }
 
 static LineWin eval_line(SymbolID a, SymbolID m, SymbolID b, int line_idx) {
-  LineWin w = {0, false, line_idx};
+  LineWin w = {0, false, false, line_idx};
+  // Kariert auf der Linie (irgendwo) -> Flag setzen (loest in Serie 2 EUR aus)
+  if (a == SYM_KARIERT || m == SYM_KARIERT || b == SYM_KARIERT) {
+    w.kariert = true;
+  }
   // 4-9-3 Spezial-Kombo
   if (a == SYM_4 && m == SYM_9 && b == SYM_3) {
     w.cent = 100; w.spezial = true; return w;
@@ -488,7 +501,7 @@ static LineWin eval_line(SymbolID a, SymbolID m, SymbolID b, int line_idx) {
   if (a == SYM_120C && m == SYM_20C && b == SYM_80C) {
     w.cent = 20; w.spezial = true; return w;
   }
-  // Krone in Mitte
+  // Krone in Mitte (alleine ein 10c/20c-Direktgewinn)
   if (m == SYM_K_ROT) { w.cent = 10; return w; }
   if (m == SYM_K_GELB) { w.cent = 20; return w; }
   // 3 gleiche Cent
@@ -566,19 +579,16 @@ static void evaluate_spin(void) {
   LineWin b = eval_line(g.reel_l[1], g.reel_m[0], g.reel_r[1], 1);
   LineWin best = (a.cent >= b.cent) ? a : b;
   bool win = (best.cent > 0);
+  bool kariert_any = a.kariert || b.kariert;
 
-  // === Serie: bei Gewinn 2 EUR + ggf. Giga-Zusatz ===
-  if (win && g.serie_mode != 'n') {
+  // === Serie: bei Gewinn ODER kariertem Feld -> 2 EUR + ggf. Giga-Zusatz ===
+  if ((win || kariert_any) && g.serie_mode != 'n') {
     g.muenzspeicher += 200;  // 2 EUR
     if (g.serie_mode == 'g') {
       giga_zusatz();
-      char buf[24];
-      snprintf(buf, sizeof(buf), "GIGA +2E +M");
-      message_set(buf, 1500);
+      message_set(kariert_any && !win ? "KARIERT +2E +M" : "GIGA +2E +M", 1500);
     } else {
-      char buf[24];
-      snprintf(buf, sizeof(buf), "SERIE +2E");
-      message_set(buf, 1500);
+      message_set(kariert_any && !win ? "KARIERT +2E" : "SERIE +2E", 1500);
     }
     g.stats_gewinne++;
     vibes_short_pulse();
@@ -586,15 +596,15 @@ static void evaluate_spin(void) {
     check_auto_auszahl();
     return;
   }
-  // In Gigaspielen ohne Treffer -> Mystery (PDF 2.3a)
-  if (!win && g.serie_mode == 'g') {
+  // In Gigaspielen ohne Treffer und ohne kariert -> Mystery (PDF 2.3a)
+  if (!win && !kariert_any && g.serie_mode == 'g') {
     mystery_ausspielung();
     g.state = STATE_IDLE;
     check_auto_auszahl();
     return;
   }
-  // Im Multi/Sonder ohne Treffer: einfach kein Gewinn
-  if (!win && g.serie_mode != 'n') {
+  // Im Multi/Sonder ohne Treffer und ohne kariert: einfach kein Gewinn
+  if (!win && !kariert_any && g.serie_mode != 'n') {
     g.state = STATE_IDLE;
     message_set("-", 800);
     return;
